@@ -1,0 +1,48 @@
+name: Multi-Stage CI/CD Pipeline
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: cicd-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    name: CI - Build and Test
+    uses: ./.github/workflows/reusable-ci.yml
+
+  deploy-dev:
+    name: CD - Development
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: build-test
+    uses: ./.github/workflows/reusable-deploy.yml
+    with:
+      environment_name: dev
+      artifact_name: app-package-${{ github.sha }}
+
+  deploy-staging:
+    name: CD - Staging
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: deploy-dev
+    uses: ./.github/workflows/reusable-deploy.yml
+    with:
+      environment_name: staging
+      artifact_name: app-package-${{ github.sha }}
+
+  deploy-production:
+    name: CD - Production
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: deploy-staging
+    uses: ./.github/workflows/reusable-deploy.yml
+    with:
+      environment_name: production
+      artifact_name: app-package-${{ github.sha }}
