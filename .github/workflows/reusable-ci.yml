@@ -1,0 +1,47 @@
+name: Reusable CI - Build and Test
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    name: Build, test and package
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Validate Python syntax
+        run: python -m py_compile app.py test_app.py
+
+      - name: Run unit tests
+        run: python -m unittest discover -v
+
+      - name: Build release package
+        run: |
+          mkdir -p dist
+          tar -czf dist/app-package.tar.gz app.py README.md
+          cd dist
+          sha256sum app-package.tar.gz > app-package.tar.gz.sha256
+          echo "Package created:"
+          ls -lh
+
+      - name: Upload versioned build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-package-${{ github.sha }}
+          path: |
+            dist/app-package.tar.gz
+            dist/app-package.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 14
