@@ -62,9 +62,11 @@ jobs:
           : "${EC2_SSH_PORT:=22}"
           : "${APP_PORT:=8000}"
           : "${HEALTHCHECK_PATH:=/health}"
-          [[ "$EC2_SSH_PORT" =~ ^[0-9]+$ ]] || exit 1
-          [[ "$APP_PORT" =~ ^[0-9]+$ ]] || exit 1
-          [[ "$HEALTHCHECK_PATH" == /* ]] || exit 1
+          [[ "$EC2_HOST" =~ ^[A-Za-z0-9.-]+$ ]] || { echo "::error::EC2_HOST must be an IP address or DNS hostname"; exit 1; }
+          [[ "$EC2_USER" =~ ^[a-z_][a-z0-9_-]*[$]?$ ]] || { echo "::error::EC2_USER has an invalid format"; exit 1; }
+          [[ "$EC2_SSH_PORT" =~ ^[0-9]{1,5}$ ]] && (( EC2_SSH_PORT >= 1 && EC2_SSH_PORT <= 65535 )) || exit 1
+          [[ "$APP_PORT" =~ ^[0-9]{1,5}$ ]] && (( APP_PORT >= 1 && APP_PORT <= 65535 )) || exit 1
+          [[ "$HEALTHCHECK_PATH" =~ ^/[A-Za-z0-9/_-]*$ ]] || { echo "::error::HEALTHCHECK_PATH has an invalid format"; exit 1; }
 
       - name: Deploy to EC2 and verify health
         env:
