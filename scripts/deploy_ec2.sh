@@ -19,7 +19,7 @@ if [[ ! "$APP_PORT" =~ ^[0-9]{1,5}$ ]] || (( APP_PORT < 1 || APP_PORT > 65535 ))
   echo "Invalid application port" >&2
   exit 2
 fi
-if [[ "$HEALTHCHECK_PATH" =~ ^/[A-Za-z0-9/_-]*$ ]] ]]; then
+if [[ ! "$HEALTHCHECK_PATH" =~ ^/[A-Za-z0-9/_-]*$ ]]; then
   echo "Health check path must start with / and contain no spaces" >&2
   exit 2
 fi
