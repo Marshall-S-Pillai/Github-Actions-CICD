@@ -1,4 +1,4 @@
-name: Reusable CD - Deploy Artifact
+name: Reusable CD - Deploy Artifact to EC2
 
 on:
   workflow_call:
@@ -20,10 +20,18 @@ jobs:
   deploy:
     name: Deploy to ${{ inputs.environment_name }}
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     environment:
       name: ${{ inputs.environment_name }}
+    concurrency:
+      group: deploy-${{ inputs.environment_name }}
+      cancel-in-progress: false
     steps:
+      - name: Checkout deployment script from this commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
       - name: Download the exact CI artifact
         uses: actions/download-artifact@v4
         with:
@@ -34,21 +42,73 @@ jobs:
         working-directory: incoming
         run: sha256sum --check app-package.tar.gz.sha256
 
-      - name: Prepare deployment payload
+      - name: Validate deployment configuration
+        env:
+          EC2_HOST: ${{ vars.EC2_HOST }}
+          EC2_USER: ${{ vars.EC2_USER }}
+          EC2_SSH_PORT: ${{ vars.EC2_SSH_PORT }}
+          APP_PORT: ${{ vars.APP_PORT }}
+          HEALTHCHECK_PATH: ${{ vars.HEALTHCHECK_PATH }}
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+          EC2_KNOWN_HOSTS: ${{ secrets.EC2_KNOWN_HOSTS }}
         run: |
-          mkdir -p "release/${{ inputs.environment_name }}"
-          tar -xzf incoming/app-package.tar.gz -C "release/${{ inputs.environment_name }}"
-          cp incoming/app-package.tar.gz.sha256 "release/${{ inputs.environment_name }}/"
-          printf 'environment=%s\nartifact=%s\ncommit=%s\n' \
-            "${{ inputs.environment_name }}" \
-            "${{ inputs.artifact_name }}" \
-            "${{ github.sha }}" > "release/${{ inputs.environment_name }}/deployment-manifest.txt"
+          set -euo pipefail
+          for name in EC2_HOST EC2_USER EC2_SSH_KEY EC2_KNOWN_HOSTS; do
+            if [[ -z "${!name}" ]]; then
+              echo "::error::$name is not configured in the ${{ inputs.environment_name }} environment"
+              exit 1
+            fi
+          done
+          : "${EC2_SSH_PORT:=22}"
+          : "${APP_PORT:=8000}"
+          : "${HEALTHCHECK_PATH:=/health}"
+          [[ "$EC2_SSH_PORT" =~ ^[0-9]+$ ]] || exit 1
+          [[ "$APP_PORT" =~ ^[0-9]+$ ]] || exit 1
+          [[ "$HEALTHCHECK_PATH" == /* ]] || exit 1
+
+      - name: Deploy to EC2 and verify health
+        env:
+          EC2_HOST: ${{ vars.EC2_HOST }}
+          EC2_USER: ${{ vars.EC2_USER }}
+          EC2_SSH_PORT: ${{ vars.EC2_SSH_PORT }}
+          APP_PORT: ${{ vars.APP_PORT }}
+          HEALTHCHECK_PATH: ${{ vars.HEALTHCHECK_PATH }}
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+          EC2_KNOWN_HOSTS: ${{ secrets.EC2_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          EC2_SSH_PORT="${EC2_SSH_PORT:-22}"
+          APP_PORT="${APP_PORT:-8000}"
+          HEALTHCHECK_PATH="${HEALTHCHECK_PATH:-/health}"
+
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$EC2_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "$EC2_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+          ssh-keygen -y -f ~/.ssh/deploy_key >/dev/null
+
+          scp -i ~/.ssh/deploy_key -P "$EC2_SSH_PORT" \
+            -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            incoming/app-package.tar.gz \
+            "$EC2_USER@$EC2_HOST:/tmp/app-package-${{ github.sha }}.tar.gz"
+          scp -i ~/.ssh/deploy_key -P "$EC2_SSH_PORT" \
+            -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            scripts/deploy_ec2.sh \
+            "$EC2_USER@$EC2_HOST:/tmp/deploy_ec2-${{ github.sha }}.sh"
+
+          ssh -i ~/.ssh/deploy_key -p "$EC2_SSH_PORT" \
+            -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            "$EC2_USER@$EC2_HOST" \
+            "sudo bash /tmp/deploy_ec2-${{ github.sha }}.sh /tmp/app-package-${{ github.sha }}.tar.gz ${{ github.sha }} ${{ inputs.environment_name }} $APP_PORT $HEALTHCHECK_PATH"
 
       - name: Deployment summary
+        if: success()
         run: |
-          echo "## Deployment completed" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Environment: ${{ inputs.environment_name }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Artifact: ${{ inputs.artifact_name }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Commit: ${{ github.sha }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Checksum: verified" >> "$GITHUB_STEP_SUMMARY"
-          echo "This capstone demonstrates a deployment hand-off. Connect your actual hosting platform in this step for a live application deployment."
+          {
+            echo "## EC2 deployment successful"
+            echo "- Environment: ${{ inputs.environment_name }}"
+            echo "- Artifact: ${{ inputs.artifact_name }}"
+            echo "- Commit: ${{ github.sha }}"
+            echo "- Health check: passed"
+          } >> "$GITHUB_STEP_SUMMARY"
