@@ -29,7 +29,7 @@ jobs:
       - name: Build release package
         run: |
           mkdir -p dist
-          tar -czf dist/app-package.tar.gz app.py README.md
+          tar -czf dist/app-package.tar.gz app.py
           cd dist
           sha256sum app-package.tar.gz > app-package.tar.gz.sha256
           echo "Package created:"
