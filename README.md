@@ -1,33 +1,38 @@
 # GitHub-Actions-CICD
 
-A production-style GitHub Actions CI/CD capstone demonstrating automated validation, reusable workflows, immutable artifact promotion, and staged deployments.
+A production-style GitHub Actions CI/CD capstone that builds and tests a Python web application, publishes one immutable artifact, and promotes that exact artifact through Development, Staging, and Production with GitHub Environment approval gates and real AWS EC2 deployments.
 
 ## Architecture
 
 ```text
-Pull request / Push
-        |
-        v
-  Reusable CI workflow
-  - Checkout source
-  - Python syntax validation
-  - Unit tests
-  - Package release archive
-  - Generate SHA-256 checksum
-  - Upload versioned artifact
-        |
-        | Push to main only
-        v
-  Development (dev)
-        |
-        v
-  Staging (approval gate)
-        |
-        v
-  Production (approval gate)
+Pull request / Push to main
+          |
+          v
+   Reusable CI workflow
+   - Checkout source
+   - Python syntax validation
+   - Unit tests (including HTTP health endpoint)
+   - Package app.py
+   - Generate SHA-256 checksum
+   - Upload app-package-<commit-sha>
+          |
+          | Push/manual run on main only
+          v
+      DEV environment
+      EC2 deployment + health check
+          |
+          v
+   STAGING environment
+   Required reviewer approval
+   EC2 deployment + health check
+          |
+          v
+  PRODUCTION environment
+   Required reviewer approval
+   EC2 deployment + health check
 ```
 
-The same artifact, named `app-package-<commit-sha>`, is downloaded and checksum-verified in every environment. The deployment workflow is intentionally platform-neutral: it prepares a release payload and manifest. Connect the final deployment step to an actual hosting platform (for example, an EC2 host, Kubernetes cluster, or cloud deployment service) to perform a live application rollout.
+The CI workflow builds the artifact once. Each deployment stage downloads the same commit-SHA artifact and verifies its checksum; it does not rebuild the application. The reusable deployment workflow uses SSH to copy the package to the environment's EC2 host, installs/updates a systemd service, switches the active release, and checks the `/health` endpoint. If the health check fails, the remote script attempts to restore the previous release.
 
 ## Repository structure
 
@@ -38,6 +43,8 @@ The same artifact, named `app-package-<commit-sha>`, is downloaded and checksum-
 │       ├── ci-cd.yml
 │       ├── reusable-ci.yml
 │       └── reusable-deploy.yml
+├── scripts/
+│   └── deploy_ec2.sh
 ├── app.py
 ├── test_app.py
 ├── .gitignore
@@ -50,63 +57,109 @@ The same artifact, named `app-package-<commit-sha>`, is downloaded and checksum-
 |---|---:|---:|---:|---:|
 | Pull request to main | Yes | No | No | No |
 | Push to non-main branch | Yes | No | No | No |
-| Push to main | Yes | Yes | Yes, after dev | Yes, after staging |
-| Manual run on main | Yes | Yes | Yes, after dev | Yes, after staging |
+| Push to main | Yes | Yes | Yes, after dev approval/deploy | Yes, after staging approval/deploy |
+| Manual run on main | Yes | Yes | Yes, after dev approval/deploy | Yes, after staging approval/deploy |
 
-Each deployment job depends on the previous stage. A failed stage prevents later stages from running. GitHub Environment protection rules can pause a deployment until an authorized reviewer approves it.
+Each deployment job depends on the previous stage. A failed build, deployment, or health check prevents later stages from running. Staging and Production pause for their configured GitHub Environment reviewers.
 
-## Initial GitHub configuration
+## One-time AWS EC2 preparation
 
-1. Open **Settings → Environments**.
-2. Create environments named exactly `dev`, `staging`, and `production`.
-3. For `staging` and `production`, enable **Required reviewers** and select the authorized reviewer(s). Save the protection rules.
-4. Optionally configure deployment branch restrictions so only `main` can deploy to staging and production.
-5. Add non-sensitive configuration under **Settings → Secrets and variables → Actions → Variables**. Suggested variable: `DEPLOYMENT_TARGET`.
-6. Add deployment credentials under **Secrets** only when integrating a real hosting platform. Suggested secret name: `DEPLOY_TOKEN`. Never commit credentials to this repository.
+Prepare one EC2 instance per environment (recommended) or deliberately isolate each environment on separate ports and paths on a shared host.
 
-The workflow references GitHub Environments by name. Environment approval rules are repository settings and must be configured by a repository administrator; they cannot be enabled merely by committing YAML.
+1. Launch Ubuntu 22.04/24.04 EC2 instances.
+2. Create/use an SSH key pair. Add the public key to the EC2 user's `~/.ssh/authorized_keys`.
+3. Ensure the GitHub runner can reach the instance on the SSH port (normally TCP 22). Restrict the security-group source to trusted runner egress ranges or use a self-hosted runner/VPN; do not open SSH to the whole internet as a permanent configuration.
+4. The deployment user must be able to run `sudo` without an interactive password for `apt-get`, `mkdir`, `chown`, `tee`, `ln`, and `systemctl`. The script installs Python 3, curl, and tar if needed.
+5. The application listens on the configured application port (default 8000). Permit inbound application traffic only from the intended load balancer/client network if external access is required. The pipeline health check runs locally on the EC2 host.
 
-## Runners, jobs and dependencies
+The deployment script uses `/opt/github-actions-cicd/<environment>/releases/<commit-sha>`, a `current` symlink, and a systemd service named `github-actions-cicd-<environment>`.
+
+## GitHub Environments, variables and secrets
+
+Open **Settings → Environments** and create these exact environment names:
+
+- `dev`
+- `staging`
+- `production`
+
+For **each** environment, add the following Environment variables:
+
+| Variable | Example | Purpose |
+|---|---|---|
+| `EC2_HOST` | `54.12.34.56` | EC2 public IP or DNS |
+| `EC2_USER` | `ubuntu` | SSH login user |
+| `EC2_SSH_PORT` | `22` | SSH port; optional, defaults to 22 |
+| `APP_PORT` | `8000` | App listening port; optional, defaults to 8000 |
+| `HEALTHCHECK_PATH` | `/health` | Local health endpoint; optional, defaults to /health |
+
+For **each** environment, add these Environment secrets:
+
+| Secret | Value |
+|---|---|
+| `EC2_SSH_KEY` | Full PEM private key contents for the matching EC2 host |
+| `EC2_KNOWN_HOSTS` | Pinned SSH host-key line for that host |
+
+Generate a known-hosts line from a trusted network/console and verify its fingerprint against the EC2 host before saving it. Example command (run from a trusted machine): `ssh-keyscan -p 22 -H EC2_PUBLIC_IP`. Do not disable host-key checking or blindly trust an unverified scan.
+
+Use a separate host/key per environment where possible. Never commit PEM files, private keys, or secret values to the repository. The reusable deployment job declares the target environment itself, so that environment's secrets and variables are available to that job after its protection rules pass.
+
+### Approval gates
+
+For `staging` and `production`:
+
+1. Open **Settings → Environments → staging**.
+2. Enable **Required reviewers** and select the authorized reviewer(s).
+3. Save protection rules.
+4. Repeat for **production**.
+5. Optionally restrict deployment branches to `main`.
+
+The YAML references the environments, but reviewers and protection rules are configured in GitHub Settings by a repository administrator. A workflow-created environment does not automatically receive reviewer rules.
+
+**Plan visibility note:** GitHub's current documentation says required reviewers are available for public repositories on current plans; for private repositories, availability depends on the plan. Check the repository's visibility and plan before relying on manual approval gates.
+
+## Runners, jobs and reusable workflows
 
 - Runner: `ubuntu-latest`.
-- `build-test`: reusable CI workflow; validates source, runs unit tests, creates the release archive and checksum, and uploads the artifact.
-- `deploy-dev`: runs after CI on pushes to main.
-- `deploy-staging`: runs only after successful development deployment.
-- `deploy-production`: runs only after successful staging deployment.
-- Reusable logic lives in `reusable-ci.yml` and `reusable-deploy.yml`; the orchestrator lives in `ci-cd.yml`.
+- `build-test`: calls `reusable-ci.yml` to compile, test, package and upload the release artifact.
+- `deploy-dev`: calls `reusable-deploy.yml` after CI on main pushes/manual runs.
+- `deploy-staging`: runs after successful Dev deployment and its approval.
+- `deploy-production`: runs after successful Staging deployment and its approval.
+- `reusable-ci.yml`: shared CI logic.
+- `reusable-deploy.yml`: shared EC2 deployment logic.
+- `ci-cd.yml`: orchestrates triggers, dependencies and promotion order.
 
-## Artifact and promotion strategy
+## Artifact integrity and promotion
 
-The CI job creates `app-package.tar.gz` and `app-package.tar.gz.sha256`. Both are uploaded as one artifact whose name includes the triggering commit SHA. Every deployment stage downloads that same artifact and validates its checksum before preparing the release payload. The pipeline does not rebuild separately for each environment.
+CI creates `app-package.tar.gz` and `app-package.tar.gz.sha256`, then uploads them together as `app-package-<github.sha>`. Every stage downloads that exact artifact and executes `sha256sum --check` before transfer. The app is never rebuilt between Dev, Staging and Production.
 
-## Configuration and secrets
+Artifacts are retained for 14 days in this demo. Increase retention or publish releases to durable artifact storage if your rollback window requires it.
 
-- Workflow-level permissions follow least privilege: repository contents are read-only.
-- Environment-specific variables belong in GitHub Environment variables.
-- Credentials belong in GitHub Environment secrets, not in YAML or source files.
-- Do not print secret values in logs.
-- Add only the permissions required by the selected deployment provider when connecting a real target.
+## Application endpoints
 
-## Rollback considerations
+- `GET /`: returns a greeting.
+- `GET /health`: returns JSON with `status=healthy` and the application version.
 
-1. Identify the last known-good commit SHA and its corresponding retained artifact.
-2. Re-run the deployment workflow for the affected environment using the known-good artifact, or revert the source change and promote the new commit through the normal pipeline.
-3. Verify the deployment health and application logs after rollback.
-4. Keep release artifacts available for the required rollback window; this example retains artifacts for 14 days.
-5. For a real deployment, implement an atomic release/symlink or platform-native rollout and health check before switching traffic.
+The service binds to `0.0.0.0` on the configured port and is managed by systemd on EC2.
+
+## Rollback
+
+The EC2 deployment script records the previous active release before switching the `current` symlink. If the new service fails its local health check, it switches the symlink back and restarts the previous release. For a manual rollback, deploy the earlier retained commit artifact through the same protected environment workflow. Keep known-good artifacts for the required rollback period and verify application logs/health after rollback.
 
 ## Troubleshooting
 
 | Symptom | Likely cause | Resolution |
 |---|---|---|
 | Workflow does not start | Event/branch does not match trigger | Check Actions tab and branch filters in `ci-cd.yml`. |
-| Unit tests fail | Application behavior or test expectation is incorrect | Read the failing assertion and reproduce with `python -m unittest discover -v`. |
-| Artifact not found | CI did not upload it, or artifact name differs | Confirm the CI job succeeded and both workflows use the same commit-SHA artifact name. |
-| Checksum verification fails | Package changed or checksum file is mismatched | Rebuild from the intended commit; do not bypass checksum validation. |
-| Staging/production waits | Required reviewer approval is pending | Review and approve the deployment in the GitHub Actions run, if authorized. |
-| Environment has no approval gate | Required reviewers were not configured | Configure the environment protection rule in repository Settings. |
-| Permission denied during real deployment | Deployment identity lacks target permissions | Grant least-privilege permissions and store credentials as environment secrets. |
-| Deployment job is skipped | Previous job failed or push was not to main | Inspect job dependencies and event/ref conditions. |
+| Unit tests fail | Application behavior or test expectation is incorrect | Read the assertion and reproduce with `python -m unittest discover -v`. |
+| Artifact not found | CI did not upload it or artifact name differs | Confirm CI succeeded and the SHA-based name matches. |
+| Checksum verification fails | Package/checksum mismatch | Rebuild from the intended commit; never bypass verification. |
+| Deployment waits | Environment approval is pending | An authorized reviewer must approve the deployment. |
+| EC2 variables/secrets are empty | They were added at repository level or to a different environment | Add them under the matching `dev`, `staging`, or `production` environment. |
+| SSH permission denied | Wrong user/key or public key missing from `authorized_keys` | Verify matching environment key, username and EC2 authorized_keys. |
+| Host key verification fails | Pinned known-hosts value is wrong/stale | Verify the host fingerprint and update `EC2_KNOWN_HOSTS`. |
+| sudo asks for a password | Deployment user lacks non-interactive sudo | Configure narrowly scoped non-interactive sudo for required deployment commands. |
+| Health check fails | Port conflict, service error, or app did not start | Check `sudo systemctl status github-actions-cicd-<env>` and `sudo journalctl -u github-actions-cicd-<env> -n 100`. |
+| Later stage is skipped | Previous deployment failed or workflow is not on main | Inspect dependencies, event and branch conditions. |
 
 ## Run locally
 
@@ -115,12 +168,8 @@ Requires Python 3.12 or compatible.
 ```bash
 python -m py_compile app.py test_app.py
 python -m unittest discover -v
-python app.py
-mkdir -p dist
-tar -czf dist/app-package.tar.gz app.py README.md
-cd dist
-sha256sum app-package.tar.gz > app-package.tar.gz.sha256
-sha256sum --check app-package.tar.gz.sha256
+python app.py --host 127.0.0.1 --port 8000
+curl http://127.0.0.1:8000/health
 ```
 
 ## Assignment checklist
@@ -128,15 +177,15 @@ sha256sum --check app-package.tar.gz.sha256
 - [x] Workflow triggered by push and pull_request events
 - [x] Multiple jobs with explicit dependencies and runner configuration
 - [x] Automated build and unit-test stages with visible pass/fail status
-- [x] Variables/secrets strategy documented; no credentials committed
-- [x] Artifact published by CI and consumed by deployment stages
+- [x] Environment variables and secrets consumed by deployment workflow
+- [x] Artifact published by CI and consumed by all deployment stages
 - [x] Reusable CI and deployment workflows
 - [x] dev, staging, and production environments referenced
-- [x] Approval gates supported through GitHub Environment protection rules (admin configuration required)
+- [x] Approval gates supported through GitHub Environment protection rules (admin setup required)
 - [x] Same packaged artifact promoted through all stages
-- [x] Pipeline behavior, assumptions, and rollback documented
-- [x] Troubleshooting guide included
+- [x] README covers behavior, assumptions, rollback and troubleshooting
+- [x] EC2 deployment, systemd service and health check implemented
 
-## Important implementation boundary
+## Important setup boundary
 
-The repository contains a working CI pipeline and a platform-neutral CD demonstration. Environment reviewer rules must be configured in GitHub Settings, and a real hosting provider/target must be connected before claiming that an application has been deployed to live infrastructure.
+The repository now contains the EC2 deployment implementation. A successful live deployment still requires you to create/prepare the EC2 target(s), configure the per-environment variables and secrets, and configure reviewer protection rules in GitHub Settings. Those account/infra settings cannot be safely guessed or created by committing workflow YAML.
